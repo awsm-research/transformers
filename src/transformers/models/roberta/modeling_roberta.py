@@ -174,6 +174,9 @@ class RobertaSelfAttention(nn.Module):
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        # ADDED* - attention gate layer
+        # each head shares only one gate mat
+        self.gate = nn.Linear(config.hidden_size, 1)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
@@ -184,6 +187,15 @@ class RobertaSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+
+    # ADDED* - init the attention gate
+    # should we add Kaiming initialization (aka. He init) here
+    ### nn.init.kaiming_uniform_(w, mode='fan_in', nonlinearity='relu')
+    def transpose_for_gate(self, x):
+        # each att head shares the same gate matrix
+        new_x_shape = x.size()[:-1] + (1, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)       
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -226,6 +238,8 @@ class RobertaSelfAttention(nn.Module):
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
+        # ADDED* - attention gate layer
+        gate_layer = self.transpose_for_gate(self.gate(hidden_states))
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -239,7 +253,12 @@ class RobertaSelfAttention(nn.Module):
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
+        # ADDED* - attention gate 
+        # <<< change to threshold mechanism
+        # for each val in gate mat, if val > 0.5
+        # keep the corresponding attention score, otherwise, set attention score to 0
+        attention_scores = torch.matmul(attention_scores, gate_layer.transpose(-1, -2))
+        
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             seq_length = hidden_states.size()[1]
             position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
@@ -255,8 +274,10 @@ class RobertaSelfAttention(nn.Module):
                 relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
                 relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
                 attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
-
+        
+        # ADDED* - should we include our gate mat here?
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in RobertaModel forward() function)
             attention_scores = attention_scores + attention_mask
