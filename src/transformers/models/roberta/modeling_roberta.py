@@ -176,7 +176,9 @@ class RobertaSelfAttention(nn.Module):
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
         # ADDED* - attention gate layer
         # each head shares only one gate mat
-        self.gate = nn.Linear(config.hidden_size, self.all_head_size)
+        # change 13 to seq length
+        self.gate = nn.Linear(13, 13)
+        self.gate_threshold = nn.Threshold(threshold=0.5, value=0)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
@@ -187,15 +189,6 @@ class RobertaSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
-
-    # ADDED* - init the attention gate
-    # should we add Kaiming initialization (aka. He init) here
-    ### nn.init.kaiming_uniform_(w, mode='fan_in', nonlinearity='relu')
-    def transpose_for_gate(self, x):
-        # each attention head shares the same gate matrix
-        new_x_shape = x.size()[:-1] + (1, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)       
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -238,10 +231,6 @@ class RobertaSelfAttention(nn.Module):
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
-        # ADDED* - attention gate layer
-        gate_layer = self.transpose_for_gate(self.gate(hidden_states))
-        gate_layer = torch.sigmoid(gate_layer)
-        print()
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -254,8 +243,29 @@ class RobertaSelfAttention(nn.Module):
             past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
+        """
+        print("Query")
+        print(query_layer.size())
+        print("Key")
+        print(key_layer.size())
+        print(key_layer.transpose(-1, -2).size())
+        """
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-   
+        """
+        print("attention scores")
+        print(attention_scores.size())
+
+        print("Hidden State")
+        print(hidden_states.size())
+        """
+        # ADDED* - attention gate layer
+        gate_layer = self.gate(attention_scores)
+        # ADDED* - sigmoid activation & threshold
+        gate_layer = torch.sigmoid(gate_layer)
+        gate_layer = self.gate_threshold(gate_layer)
+        ### ADDED* - apply attention Gate
+        attention_scores = torch.matmul(attention_scores, gate_layer)
+
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             seq_length = hidden_states.size()[1]
             position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
@@ -288,12 +298,19 @@ class RobertaSelfAttention(nn.Module):
         # Mask heads if we want to
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
-
-        
+        """
+        print("Attention Prob.")
+        print(attention_probs.size())
+        print("Val Layer.")
+        print(value_layer.size())
+        """
         context_layer = torch.matmul(attention_probs, value_layer)
-        ### ADDED* - apply attention Gate
-        context_layer = torch.matmul(context_layer, gate_layer)
-
+        """
+        print("Context Layer")
+        print(context_layer.size())
+        print("Gate Layer")
+        print(gate_layer.size())
+        """
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
